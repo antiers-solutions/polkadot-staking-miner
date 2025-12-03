@@ -55,7 +55,7 @@ pub(crate) async fn fetch_candidates(client: &Client) -> Result<Vec<(AccountId, 
 		candidate_accounts.len()
 	);
 
-	let stakes = fetch_stakes_in_batches(client, &candidate_accounts).await?;
+	let stakes = fetch_stakes_in_batches(client, &candidate_accounts, false).await?;
 
 	let candidates: Vec<(AccountId, u128)> =
 		candidate_accounts.into_iter().zip(stakes.into_iter()).collect();
@@ -66,37 +66,61 @@ pub(crate) async fn fetch_candidates(client: &Client) -> Result<Vec<(AccountId, 
 }
 
 /// Fetch stakes in batches for better performance with retry logic for RPC rate limits
+/// use_total: true for nominators (use 'total' stake), false for validators (use 'active' stake)
 pub(crate) async fn fetch_stakes_in_batches(
 	client: &Client,
 	accounts: &[AccountId],
+	use_total: bool,
 ) -> Result<Vec<u128>, Error> {
-	const BATCH_SIZE: usize = 250;
-	const MAX_CONCURRENT_BATCHES: usize = 15;
-	const MAX_RETRIES: u32 = 5;
+	const BATCH_SIZE: usize = 100; // Reduced from 250 to avoid rate limits
+	const MAX_CONCURRENT_BATCHES: usize = 5; // Reduced from 15 to avoid rate limits
+	const MAX_RETRIES: u32 = 10; // Increased retries
+	const INITIAL_RETRY_DELAY: u64 = 2; // Start with 2 seconds
 
 	let mut stakes = Vec::with_capacity(accounts.len());
 	let mut batch_handles: Vec<tokio::task::JoinHandle<Result<Vec<u128>, Error>>> = Vec::new();
 
 	let mut processed_accounts: usize = 0;
 
-	for chunk in accounts.chunks(BATCH_SIZE) {
+	for (chunk_idx, chunk) in accounts.chunks(BATCH_SIZE).enumerate() {
 		let chunk = chunk.to_vec();
 		let client_clone = client.clone();
+		let use_total = use_total;
+
+		// Add a small delay between batches to avoid rate limits
+		if chunk_idx > 0 && chunk_idx % MAX_CONCURRENT_BATCHES == 0 {
+			tokio::time::sleep(Duration::from_millis(500)).await;
+		}
 
 		let handle = tokio::spawn(async move {
 			// Retry logic for individual batch
-			let mut last_error: Option<Error> = None;
+			let mut last_error_msg: Option<String> = None;
 			for attempt in 0..=MAX_RETRIES {
-				match fetch_stakes_batch_static(&client_clone, &chunk).await {
+				match fetch_stakes_batch_static(&client_clone, &chunk, use_total).await {
 					Ok(batch_stakes) => return Ok(batch_stakes),
 					Err(e) => {
 						let error_msg = format!("{e}");
-						if (error_msg.contains("limit reached") || error_msg.contains("RPC error")) &&
-							attempt < MAX_RETRIES
-						{
-							last_error = Some(e);
-							let delay = Duration::from_secs(1) * (1 << attempt); // Exponential backoff
-							tokio::time::sleep(delay.min(Duration::from_secs(30))).await;
+						// Check for various rate limit error formats (including wrapped subxt errors)
+						let is_rate_limit = error_msg.contains("limit reached") ||
+							error_msg.contains("RPC error") ||
+							error_msg.contains("subxt error") ||
+							error_msg.contains("rate limit") ||
+							error_msg.contains("too many requests") ||
+							error_msg.contains("429");
+						
+						if is_rate_limit && attempt < MAX_RETRIES {
+							last_error_msg = Some(error_msg.clone());
+							// Exponential backoff: 2s, 4s, 8s, 16s, 32s, max 60s
+							let delay_secs = INITIAL_RETRY_DELAY * (1 << attempt);
+							let delay = Duration::from_secs(delay_secs.min(60));
+							log::warn!(
+								target: LOG_TARGET,
+								"Rate limit hit for batch (attempt {}/{}), retrying in {}s...",
+								attempt + 1,
+								MAX_RETRIES + 1,
+								delay_secs
+							);
+							tokio::time::sleep(delay).await;
 							continue;
 						} else {
 							return Err(e);
@@ -104,7 +128,7 @@ pub(crate) async fn fetch_stakes_in_batches(
 					},
 				}
 			}
-			Err(last_error.unwrap_or_else(|| Error::Other("Failed after retries".into())))
+			Err(Error::Other(format!("Failed after {} retries: {}", MAX_RETRIES + 1, last_error_msg.unwrap_or_else(|| "Unknown error".into()))))
 		});
 
 		batch_handles.push(handle);
@@ -155,9 +179,12 @@ pub(crate) async fn fetch_stakes_in_batches(
 }
 
 /// Static version of stake fetching for use in spawned tasks
+/// For validators/candidates: uses 'active' stake (their own stake)
+/// For nominators: uses 'total' stake (what they've staked)
 pub(crate) async fn fetch_stakes_batch_static(
 	client: &Client,
 	accounts: &[AccountId],
+	use_total: bool,
 ) -> Result<Vec<u128>, Error> {
 	let at = client.chain_api().storage().at_latest().await?;
 
@@ -175,16 +202,25 @@ pub(crate) async fn fetch_stakes_batch_static(
 			if let Some(ledger) = at.fetch(&ledger_addr).await? &&
 				let Ok(value) = ledger.to_value()
 			{
-				// Try to get 'active' first (self-stake), fallback to 'total' if 'active' not
-				// available In Polkadot, 'active' is the active stake which includes
-				// self-stake 'total' is the total stake (self + nominators)
-				// For election purposes, we use 'active' as it represents the validator's own
-				// stake
-				if let Some(active) = value.at("active").and_then(|v| v.as_u128()) {
-					stake = active;
-				} else if let Some(total) = value.at("total").and_then(|v| v.as_u128()) {
-					// Fallback to total if active is not available
-					stake = total;
+				if use_total {
+					// For nominators: use 'total' stake (what they've staked)
+					if let Some(total) = value.at("total").and_then(|v| v.as_u128()) {
+						stake = total;
+					} else if let Some(active) = value.at("active").and_then(|v| v.as_u128()) {
+						// Fallback to active if total is not available
+						stake = active;
+					}
+				} else {
+					// For validators/candidates: use 'active' stake (their own stake)
+					// In Polkadot, 'active' is the active stake which includes self-stake
+					// 'total' is the total stake (self + nominators)
+					// For election purposes, we use 'active' as it represents the validator's own stake
+					if let Some(active) = value.at("active").and_then(|v| v.as_u128()) {
+						stake = active;
+					} else if let Some(total) = value.at("total").and_then(|v| v.as_u128()) {
+						// Fallback to total if active is not available
+						stake = total;
+					}
 				}
 			}
 
@@ -254,14 +290,33 @@ pub(crate) async fn fetch_nominators(
 	log::info!(target: LOG_TARGET, "Fetching stakes of nominators");
 
 	let nominator_stashes: Vec<AccountId> = nominators.iter().map(|e| e.0.clone()).collect();
-	let nominator_stakes_u128 = fetch_stakes_in_batches(client, &nominator_stashes).await?;
+	let nominator_stakes_u128 = fetch_stakes_in_batches(client, &nominator_stashes, true).await?;
 
 	let mut nominators_with_stakes: Vec<(AccountId, u64, Vec<AccountId>)> =
 		Vec::with_capacity(nominators.len());
+	let mut filtered_count = 0usize;
 	for ((stash, targets), stake_u128) in nominators.into_iter().zip(nominator_stakes_u128) {
+		// Filter out nominators with zero stake or empty targets (matching snapshot behavior)
+		if stake_u128 == 0 || targets.is_empty() {
+			filtered_count += 1;
+			continue;
+		}
 		let stake_u64 = u64::try_from(stake_u128).unwrap_or(u64::MAX);
 		nominators_with_stakes.push((stash.clone(), stake_u64, targets.clone()));
 	}
+
+	if filtered_count > 0 {
+		log::info!(
+			target: LOG_TARGET,
+			"Filtered out {filtered_count} nominators with zero stake or empty targets"
+		);
+	}
+
+	log::info!(
+		target: LOG_TARGET,
+		"Final nominator count after filtering: {}",
+		nominators_with_stakes.len()
+	);
 
 	Ok(nominators_with_stakes)
 }

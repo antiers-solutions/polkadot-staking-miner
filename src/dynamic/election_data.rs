@@ -134,6 +134,10 @@ where
 	// Extract only accounts from candidates
 	let target_accounts: Vec<AccountId> =
 		candidates.into_iter().map(|(account, _)| account).collect();
+	
+	// Create a set for fast lookup of valid candidates
+	let valid_targets: HashSet<AccountId> = target_accounts.iter().cloned().collect();
+	
 	log::info!(
 		target: LOG_TARGET,
 		"Collected {} target accounts from candidates",
@@ -161,12 +165,31 @@ where
 	);
 
 	let mut voter_pages_vec: Vec<VoterSnapshotPageOf<T>> = Vec::new();
+	let mut filtered_invalid_targets = 0usize;
+	let mut final_voter_count = 0usize;
 	for (stash, stake, votes) in nominators {
+		// Filter out invalid targets (targets that aren't valid candidates)
+		let original_vote_count = votes.len();
+		let valid_votes: Vec<AccountId> = votes.into_iter()
+			.filter(|target| valid_targets.contains(target))
+			.collect();
+		
+		if valid_votes.len() < original_vote_count {
+			filtered_invalid_targets += original_vote_count - valid_votes.len();
+		}
+		
+		// Skip nominators with no valid targets after filtering
+		if valid_votes.is_empty() {
+			continue;
+		}
+		
 		let votes: BoundedVec<AccountId, <T as MinerConfig>::MaxVotesPerVoter> =
-			BoundedVec::truncate_from(votes);
+			BoundedVec::truncate_from(valid_votes);
 
 		let voter: Voter<T> = (stash, stake, votes);
 
+		final_voter_count += 1;
+		
 		// Start a new page if we have no pages yet or the last page is full
 		if voter_pages_vec.last().is_none_or(|last| last.len() >= per_voter_page as usize) {
 			voter_pages_vec.push(BoundedVec::truncate_from(vec![voter]));
@@ -190,12 +213,19 @@ where
 	}
 
 	let n_pages = voter_pages_vec.len();
+	
+	if filtered_invalid_targets > 0 {
+		log::info!(
+			target: LOG_TARGET,
+			"Filtered out {filtered_invalid_targets} invalid target references (targets not in candidate list)"
+		);
+	}
 
 	log::info!(
 		target: LOG_TARGET,
 		"Converted staking data: {} targets, {} voters across {} pages",
 		all_targets.len(),
-		total_nominators,
+		final_voter_count,
 		n_pages
 	);
 
@@ -309,6 +339,25 @@ where
 	let mut nominator_predictions: Vec<NominatorPrediction> = Vec::new();
 
 	for (nominator, stake, nominated_targets) in all_voters {
+		// Many validators are also recorded as self-nominators (a voter whose only
+		// nomination target is itself). This is useful for the election algorithm,
+		// but in the exported nominators JSON it shows up as a "duplicate" entry
+		// for the validator.
+		//
+		// To avoid this, we drop any voter that:
+		//   - is itself a winning validator, AND
+		//   - all of its nomination targets are exactly itself.
+		//
+		// Validators who nominate *other* validators will still appear as
+		// nominators, which is desirable.
+		let is_pure_self_validator_nominator = active_set.contains(&nominator) &&
+			!nominated_targets.is_empty() &&
+			nominated_targets.iter().all(|t| t == &nominator);
+
+		if is_pure_self_validator_nominator {
+			continue;
+		}
+
 		let nominator_encoded = encode_account_id(&nominator, ctx.ss58_prefix);
 		let allocations = allocation_map.get(&nominator);
 
@@ -393,6 +442,6 @@ where
 				convert_staking_data_to_snapshots::<T>(candidates, nominators)?;
 
 			Ok((target_snapshot, voter_snapshot, ElectionDataSource::Staking))
-		},
+		}
 	}
 }
