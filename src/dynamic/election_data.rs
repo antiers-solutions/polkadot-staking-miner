@@ -432,7 +432,11 @@ where
 				.await
 				.map_err(|e| Error::Other(format!("Failed to fetch candidates: {e}")))?;
 
-			let nominators = fetch_nominators(client)
+			// Extract candidate accounts for nominator filtering logic
+			let candidate_accounts: Vec<AccountId> =
+				candidates.iter().map(|(account, _)| account.clone()).collect();
+
+			let nominators = fetch_nominators(client, &candidate_accounts)
 				.await
 				.map_err(|e| Error::Other(format!("Failed to fetch nominators: {e}")))?;
 

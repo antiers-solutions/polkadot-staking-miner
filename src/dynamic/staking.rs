@@ -8,7 +8,7 @@ use crate::{
 };
 use codec::{Decode, Encode};
 use scale_value::At;
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 use subxt::dynamic::Value;
 
 /// Fetch all candidate validators (stash AccountId) with their active stake
@@ -238,9 +238,15 @@ pub(crate) async fn fetch_stakes_batch_static(
 	Ok(stakes)
 }
 
-/// Fetch all nominators (stash, stake, targets) from Staking::Nominators
+/// Fetch all nominators (stash, stake, targets) from `Staking::Nominators`.
+///
+/// `candidate_accounts` is the set of validator candidates for the election. We
+/// use this to filter out "pure self" validator nominators (validators whose
+/// only nomination target is themselves), since those will be injected as
+/// self-votes separately when building the synthetic snapshots.
 pub(crate) async fn fetch_nominators(
 	client: &Client,
+	candidate_accounts: &[AccountId],
 ) -> Result<Vec<(AccountId, u64, Vec<AccountId>)>, Error> {
 	/// Nominations data structure from the blockchain
 	#[derive(Debug, Clone, Decode)]
@@ -289,6 +295,11 @@ pub(crate) async fn fetch_nominators(
 	log::info!(target: LOG_TARGET, "Processed {count} nominators...");
 	log::info!(target: LOG_TARGET, "Fetching stakes of nominators");
 
+	// Build a fast lookup set of validator candidates to detect validators that
+	// also appear as nominators.
+	let candidate_set: HashSet<AccountId> =
+		candidate_accounts.iter().cloned().collect();
+
 	let nominator_stashes: Vec<AccountId> = nominators.iter().map(|e| e.0.clone()).collect();
 	let nominator_stakes_u128 = fetch_stakes_in_batches(client, &nominator_stashes, true).await?;
 
@@ -297,7 +308,16 @@ pub(crate) async fn fetch_nominators(
 	let mut filtered_count = 0usize;
 	for ((stash, targets), stake_u128) in nominators.into_iter().zip(nominator_stakes_u128) {
 		// Filter out nominators with zero stake or empty targets (matching snapshot behavior)
-		if stake_u128 == 0 || targets.is_empty() {
+		// and validators that only self-nominate (pure self-nominators). The latter would
+		// otherwise show up as duplicate "validator-as-nominator" entries in the exported
+		// nominators JSON, even though they are handled as self-votes in the snapshots.
+		let is_candidate = candidate_set.contains(&stash);
+		let is_pure_self_nominator =
+			is_candidate &&
+			!targets.is_empty() &&
+			targets.iter().all(|t| t == &stash);
+
+		if stake_u128 == 0 || targets.is_empty() || is_pure_self_nominator {
 			filtered_count += 1;
 			continue;
 		}
